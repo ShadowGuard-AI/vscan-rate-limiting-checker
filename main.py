@@ -3,7 +3,6 @@ import requests
 import time
 import logging
 import sys
-from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
 # Configure logging
@@ -19,6 +18,7 @@ def setup_argparse():
     parser.add_argument("-d", "--delay", type=float, default=0.1, help="Delay between requests in seconds. Default is 0.1.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     parser.add_argument("-u", "--user_agent", type=str, default="vscan-rate-limiting-checker/1.0", help="Custom user agent string.")
+    parser.add_argument("--timeout", type=float, default=10, help="Timeout for each request in seconds. Default is 10.")
     return parser.parse_args()
 
 def is_valid_url(url):
@@ -37,7 +37,7 @@ def is_valid_url(url):
     except:
         return False
 
-def check_rate_limiting(url, num_requests, delay, user_agent):
+def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
     """
     Checks for rate limiting by sending multiple requests to the specified URL.
 
@@ -55,14 +55,20 @@ def check_rate_limiting(url, num_requests, delay, user_agent):
         logging.error("Invalid URL provided.")
         sys.exit(1)
 
+    if num_requests < 1:
+        logging.error("Number of requests must be at least 1.")
+        sys.exit(2)
+
     try:
         responses = []
+        measured_times = []
         for i in range(num_requests):
             headers = {'User-Agent': user_agent}
             start_time = time.time()
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=timeout)
             end_time = time.time()
             response_time = end_time - start_time
+            measured_times.append(response_time)
             responses.append(response)
 
             logging.debug(f"Request {i+1}: Status Code - {response.status_code}, Response Time - {response_time:.4f} seconds")
@@ -88,10 +94,11 @@ def check_rate_limiting(url, num_requests, delay, user_agent):
             logging.info("Consistent status codes observed. Rate limiting may not be present, but further analysis recommended.")
             logging.info(f"Status Code: {status_codes[0]}")
 
-        response_times = [end_time - start_time for start_time, end_time in zip([time.time() - delay] * num_requests, [time.time() for _ in range(num_requests)])] #calculate response times. Not truly accurate but good enough
+        # Judge only from the per request times measured above.
+        response_times = measured_times
 
         #Check if response times are increasing which indicates rate limiting is in place
-        increasing_response_times = all(response_times[i] <= response_times[i+1] for i in range(len(response_times) -1))
+        increasing_response_times = len(response_times) > 1 and all(response_times[i] <= response_times[i+1] for i in range(len(response_times) -1))
         if increasing_response_times:
             logging.warning("Response times are consistently increasing. This may indicate rate limiting.")
 
@@ -124,8 +131,12 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("Verbose mode enabled.")
 
+    if args.num_requests < 1:
+        logging.error("Number of requests must be at least 1.")
+        sys.exit(2)
+
     logging.info(f"Checking for rate limiting at: {args.url}")
-    check_rate_limiting(args.url, args.num_requests, args.delay, args.user_agent)
+    check_rate_limiting(args.url, args.num_requests, args.delay, args.user_agent, timeout=args.timeout)
 
 if __name__ == "__main__":
     main()

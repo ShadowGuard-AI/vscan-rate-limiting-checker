@@ -13,6 +13,7 @@ Checks if rate limiting is implemented on sensitive endpoints by sending multipl
 - `-d`: Delay between requests in seconds. Default is 0.1.
 - `-v`: No description provided
 - `-u`: Custom user agent string.
+- `--timeout`: Timeout for each request in seconds. Default is 10.
 
 ## License
 Copyright (c) ShadowStrikeHQ
