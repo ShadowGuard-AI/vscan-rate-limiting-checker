@@ -65,6 +65,7 @@ def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
         for i in range(num_requests):
             headers = {'User-Agent': user_agent}
             start_time = time.time()
+            # Each request opens a fresh connection, with no session reuse, so the time I record includes DNS and the TLS handshake every round. A limiter keyed on connections rather than requests is also being fed one connection per request, which is not how a browser or a kept alive client would meet it.
             response = requests.get(url, headers=headers, timeout=timeout)
             end_time = time.time()
             response_time = end_time - start_time
@@ -83,6 +84,7 @@ def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
             logging.info(f"Unique Status Codes: {unique_status_codes}")
 
             # Check for common rate limiting status codes (e.g., 429, 503)
+            # This line only runs when more than one distinct status code appeared. A target that answers 429 from the very first request, because the caller was already over budget, produces one consistent code and lands in the branch below that reports limiting may not be present: the strongest possible evidence reads as the weakest.
             rate_limited = any(code in [429, 503] for code in status_codes)
             if rate_limited:
                 logging.warning("Rate limiting likely detected based on status codes (429 or 503).")
@@ -98,12 +100,14 @@ def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
         response_times = measured_times
 
         #Check if response times are increasing which indicates rate limiting is in place
+        # Monotonic across every single step is a strict demand on a noisy network. One fast response in the middle of a genuine throttle resets the verdict, and ordinary jitter on an unthrottled target can also produce a short rising run by chance at small request counts.
         increasing_response_times = len(response_times) > 1 and all(response_times[i] <= response_times[i+1] for i in range(len(response_times) -1))
         if increasing_response_times:
             logging.warning("Response times are consistently increasing. This may indicate rate limiting.")
 
         #Check for changes in content length
         content_lengths = [len(response.content) for response in responses]
+        # Length changes are weak evidence on any page with a clock, a rotating banner, or a request counter in it. I flag the possibility and name nothing stronger, because this signal alone cannot separate a limiter's block page from ordinary dynamic content.
         unique_content_lengths = set(content_lengths)
 
         if len(unique_content_lengths) > 1:
@@ -112,6 +116,7 @@ def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
 
 
 
+    # One failed request anywhere in the run discards every response gathered before it and exits. A limiter that starts dropping connections halfway through, which is a real limiting behaviour, is reported as a failed check rather than as evidence.
     except requests.exceptions.RequestException as e:
         logging.error(f"Request failed: {e}")
         sys.exit(1)
