@@ -24,17 +24,17 @@ def setup_argparse():
 def is_valid_url(url):
     """
     Validates if the given URL is properly formatted.
-    
+
     Args:
         url (str): The URL to validate.
-    
+
     Returns:
-        bool: True if the URL is valid, False otherwise.
+        bool: True if the URL is an http or https URL with a host, False otherwise.
     """
     try:
         result = urlparse(url)
-        return all([result.scheme, result.netloc])
-    except:
+        return result.scheme in ("http", "https") and bool(result.netloc)
+    except Exception:
         return False
 
 def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
@@ -59,71 +59,93 @@ def check_rate_limiting(url, num_requests, delay, user_agent, timeout=10):
         logging.error("Number of requests must be at least 1.")
         sys.exit(2)
 
-    try:
-        responses = []
-        measured_times = []
+    if delay < 0:
+        logging.error("Delay must be non-negative.")
+        sys.exit(2)
+
+    if timeout <= 0:
+        logging.error("Timeout must be positive.")
+        sys.exit(2)
+
+    responses = []
+    measured_times = []
+    failures = 0
+    # One session for the whole run, so connections are reused the way a
+    # kept-alive client would reuse them and timings do not include a fresh
+    # handshake on every request.
+    with requests.Session() as session:
         for i in range(num_requests):
             headers = {'User-Agent': user_agent}
             start_time = time.time()
-            # Each request opens a fresh connection, with no session reuse, so the time I record includes DNS and the TLS handshake every round. A limiter keyed on connections rather than requests is also being fed one connection per request, which is not how a browser or a kept alive client would meet it.
-            response = requests.get(url, headers=headers, timeout=timeout)
+            try:
+                response = session.get(url, headers=headers, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                # A failed request is recorded and the run continues with the
+                # responses already gathered. A limiter that starts dropping
+                # connections partway through is evidence, not a reason to
+                # discard everything before it. Only a run with no successful
+                # response at all is a failed check.
+                failures += 1
+                logging.warning(f"Request {i+1} failed: {e}")
+                if delay and i < num_requests - 1:
+                    time.sleep(delay)
+                continue
             end_time = time.time()
             response_time = end_time - start_time
             measured_times.append(response_time)
             responses.append(response)
 
             logging.debug(f"Request {i+1}: Status Code - {response.status_code}, Response Time - {response_time:.4f} seconds")
-            time.sleep(delay)
+            if delay and i < num_requests - 1:
+                time.sleep(delay)
 
-        # Analyze responses
-        status_codes = [response.status_code for response in responses]
-        unique_status_codes = set(status_codes)
-
-        if len(unique_status_codes) > 1:
-            logging.warning("Multiple status codes detected. This may indicate rate limiting.")
-            logging.info(f"Unique Status Codes: {unique_status_codes}")
-
-            # Check for common rate limiting status codes (e.g., 429, 503)
-            # This line only runs when more than one distinct status code appeared. A target that answers 429 from the very first request, because the caller was already over budget, produces one consistent code and lands in the branch below that reports limiting may not be present: the strongest possible evidence reads as the weakest.
-            rate_limited = any(code in [429, 503] for code in status_codes)
-            if rate_limited:
-                logging.warning("Rate limiting likely detected based on status codes (429 or 503).")
-            else:
-                logging.info("Further analysis may be needed to confirm rate limiting.")
-
-
-        else:
-            logging.info("Consistent status codes observed. Rate limiting may not be present, but further analysis recommended.")
-            logging.info(f"Status Code: {status_codes[0]}")
-
-        # Judge only from the per request times measured above.
-        response_times = measured_times
-
-        #Check if response times are increasing which indicates rate limiting is in place
-        # Monotonic across every single step is a strict demand on a noisy network. One fast response in the middle of a genuine throttle resets the verdict, and ordinary jitter on an unthrottled target can also produce a short rising run by chance at small request counts.
-        increasing_response_times = len(response_times) > 1 and all(response_times[i] <= response_times[i+1] for i in range(len(response_times) -1))
-        if increasing_response_times:
-            logging.warning("Response times are consistently increasing. This may indicate rate limiting.")
-
-        #Check for changes in content length
-        content_lengths = [len(response.content) for response in responses]
-        # Length changes are weak evidence on any page with a clock, a rotating banner, or a request counter in it. I flag the possibility and name nothing stronger, because this signal alone cannot separate a limiter's block page from ordinary dynamic content.
-        unique_content_lengths = set(content_lengths)
-
-        if len(unique_content_lengths) > 1:
-                logging.warning("Multiple content lengths detected, Possible rate limiting based on content returned.")
-                logging.info(f"Unique Content Lengths: {unique_content_lengths}")
-
-
-
-    # One failed request anywhere in the run discards every response gathered before it and exits. A limiter that starts dropping connections halfway through, which is a real limiting behaviour, is reported as a failed check rather than as evidence.
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+    if not responses:
+        logging.error(f"Request failed: all {num_requests} requests failed, no responses to analyze.")
         sys.exit(1)
 
+    if failures:
+        logging.warning(f"{failures} of {num_requests} requests failed. Dropped connections can themselves be a rate limiting behaviour. Analysis below covers the {len(responses)} successful responses only.")
+
+    # Analyze responses
+    status_codes = [response.status_code for response in responses]
+    unique_status_codes = set(status_codes)
+
+    # The 429 and 503 check runs on every run, including a run where the
+    # target answered 429 from the very first request and the code never
+    # varied. A consistent 429 is the strongest status evidence there is.
+    rate_limited = any(code in (429, 503) for code in status_codes)
+    if rate_limited:
+        logging.warning("Rate limiting likely detected based on status codes (429 or 503).")
+    elif len(unique_status_codes) > 1:
+        logging.warning("Multiple status codes detected. This may indicate rate limiting.")
+        logging.info(f"Unique Status Codes: {unique_status_codes}")
+        logging.info("Further analysis may be needed to confirm rate limiting.")
+    else:
+        logging.info("Consistent status codes observed. Rate limiting may not be present, but further analysis recommended.")
+        logging.info(f"Status Code: {status_codes[0]}")
+
+    # Response time trend: compare the average of the second half of the
+    # run with the average of the first half instead of demanding that
+    # every single step rise, which one fast response in the middle of a
+    # genuine throttle would defeat. A second half at least 25 percent
+    # slower than the first half is flagged.
+    response_times = measured_times
+    if len(response_times) >= 3:
+        half = len(response_times) // 2
+        first_avg = sum(response_times[:half]) / half
+        second_avg = sum(response_times[half:]) / (len(response_times) - half)
+        if first_avg > 0 and second_avg > first_avg * 1.25:
+            logging.warning(f"Response times are rising: first half average {first_avg:.4f} seconds, second half average {second_avg:.4f} seconds. This may indicate rate limiting.")
+
+    # Check for changes in content length. Length changes are weak evidence
+    # on any page with a clock, a rotating banner, or a request counter in
+    # it, so this signal is flagged as a possibility and nothing stronger.
+    content_lengths = [len(response.content) for response in responses]
+    unique_content_lengths = set(content_lengths)
+
+    if len(unique_content_lengths) > 1:
+        logging.warning("Multiple content lengths detected, Possible rate limiting based on content returned.")
+        logging.info(f"Unique Content Lengths: {unique_content_lengths}")
 
 
 def main():
@@ -138,6 +160,14 @@ def main():
 
     if args.num_requests < 1:
         logging.error("Number of requests must be at least 1.")
+        sys.exit(2)
+
+    if args.delay < 0:
+        logging.error("Delay must be non-negative.")
+        sys.exit(2)
+
+    if args.timeout <= 0:
+        logging.error("Timeout must be positive.")
         sys.exit(2)
 
     logging.info(f"Checking for rate limiting at: {args.url}")
